@@ -1,72 +1,72 @@
 defmodule Tds.Query do
-  alias Tds.Parameter
-  alias Tds.Types
+  alias Tds.Query
 
+  @type t :: %Query{
+          statement: String.t(),
+          handle: any
+        }
   defstruct [:statement, :handle]
+end
 
-  defimpl DBConnection.Query, for: Tds.Query do
-    def encode(_statement, [], _opts) do
-      []
-    end
+defimpl DBConnection.Query, for: Tds.Query do
+  def encode(_statement, [], _opts) do
+    []
+  end
 
-    def encode(
-          %Tds.Query{
-            statement: statement,
-            handle: handle
-          } = _,
-          params,
-          _opts
-        ) do
-      case handle do
-        nil ->
-          param_desc =
-            params
-            |> Enum.map(fn %Parameter{} = param ->
-                 Types.encode_param_descriptor(param)
-               end)
-
-          param_desc =
-            param_desc
-            |> Enum.join(", ")
-
-          [
-            %Parameter{value: statement, type: :string},
-            %Parameter{value: param_desc, type: :string}
-          ] ++ params
-
-        _ ->
+  def encode(
+        %Tds.Query{statement: statement, handle: handle} = _,
+        params,
+        _opts
+      ) do
+    case handle do
+      nil ->
+        param_desc =
           params
-      end
-    end
+          |> Enum.map(fn %Tds.Parameter{} = param ->
+            Tds.Types.encode_param_descriptor(param)
+          end)
 
-    def decode(_query, result, opts) do
-      mapper = opts[:decode_mapper] || fn x -> x end
-      %Tds.Result{rows: rows} = result
-      rows = do_decode(rows, mapper, [])
-      %Tds.Result{result | rows: rows}
-    end
+        param_desc =
+          param_desc
+          |> Enum.join(", ")
 
-    def do_decode([row | rows], mapper, decoded) do
-      decoded = [mapper.(row) | decoded]
-      do_decode(rows, mapper, decoded)
-    end
+        [
+          %Tds.Parameter{value: statement, type: :string},
+          %Tds.Parameter{value: param_desc, type: :string}
+        ] ++ params
 
-    def do_decode(_, _, decoded) do
-      decoded
-    end
-
-    def parse(params, _) do
-      params
-    end
-
-    def describe(query, _) do
-      query
+      _ ->
+        params
     end
   end
 
-  defimpl String.Chars, for: Tds.Query do
-    def to_string(%Tds.Query{statement: statement}) do
-      IO.iodata_to_binary(statement)
-    end
+  def decode(_query, result, opts) do
+    mapper = opts[:decode_mapper] || fn x -> x end
+    %Tds.Result{rows: rows} = result
+    rows = do_decode(rows, mapper, [])
+    %Tds.Result{result | rows: rows}
+  end
+
+  def do_decode([row | rows], mapper, decoded) do
+    decoded = [mapper.(row) | decoded]
+    do_decode(rows, mapper, decoded)
+  end
+
+  def do_decode(_, _, decoded) do
+    decoded
+  end
+
+  def parse(params, _) do
+    params
+  end
+
+  def describe(query, _) do
+    query
+  end
+end
+
+defimpl String.Chars, for: Tds.Query do
+  def to_string(%Tds.Query{statement: statement}) do
+    IO.iodata_to_binary(statement)
   end
 end

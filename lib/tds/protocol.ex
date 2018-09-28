@@ -6,6 +6,7 @@ defmodule Tds.Protocol do
   import Tds.Messages
   import Tds.Utils
 
+  alias Tds.Protocol
   alias Tds.Parameter
   alias Tds.Query
 
@@ -24,6 +25,21 @@ defmodule Tds.Protocol do
     :serializable
   ]
 
+  @type t :: %Protocol{
+          sock: any,
+          usock: any,
+          itcp: integer(),
+          opts: Keyword.t(),
+          state: :ready,
+          tail: binary(),
+          pak_header: binary(),
+          pak_data: binary(),
+          result: list() | nil,
+          query: list() | nil,
+          transaction: :started | :successful | :failed,
+          env: map()
+        }
+
   defstruct sock: nil,
             usock: nil,
             itcp: nil,
@@ -40,6 +56,9 @@ defmodule Tds.Protocol do
             transaction: nil,
             env: %{trans: <<0x00>>, savepoint: 0}
 
+  @impl DBConnection
+  @spec connect(opts :: Keyword.t()) ::
+          {:ok, state :: Protocol.t()} | {:error, Exception.t()}
   def connect(opts) do
     opts =
       opts
@@ -66,6 +85,8 @@ defmodule Tds.Protocol do
     end
   end
 
+  @impl DBConnection
+  @spec disconnect(err :: Exception.t(), state :: Protocol.t()) :: :ok
   def disconnect(_err, %{sock: {mod, sock}} = s) do
     # If socket is active we flush any socket messages so the next
     # socket does not get the messages.
@@ -73,7 +94,9 @@ defmodule Tds.Protocol do
     mod.close(sock)
   end
 
-  @spec ping(any) :: {:ok, any} | {:disconnect, Exception.t(), any}
+  @impl DBConnection
+  @spec ping(Protocol.t()) ::
+          {:ok, Protocol.t()} | {:disconnect, Exception.t(), Protocol.t()}
   def ping(state) do
     case send_query(~s{SELECT 'pong' as [msg]}, state) do
       {:ok, _, s} ->
@@ -87,28 +110,47 @@ defmodule Tds.Protocol do
           if Exception.exception?(err) do
             err
           else
-            %Tds.Error{message: inspect(err)}
+            Tds.Error.exception(inspect(err))
           end
 
         {:disconnect, err, s}
 
       any ->
-        any
+        {:disconnect, Tds.Error.exception(inspect(any)), state}
     end
   end
 
+  @impl DBConnection
+  @spec checkout(state :: Protocol.t()) ::
+          {:ok, new_state :: any}
+          | {:disconnect, Exception.t(), new_state :: any}
   def checkout(%{sock: {_mod, sock}} = s) do
-    :ok = :inet.setopts(sock, active: false)
-
-    {:ok, s}
+    case :inet.setopts(sock, active: false) do
+      :ok -> {:ok, s}
+      {:error, posix} -> {:disconnect, Tds.Error.exception(posix), s}
+    end
   end
 
+  @impl DBConnection
+  @spec checkin(state :: any) ::
+          {:ok, new_state :: any}
+          | {:disconnect, Exception.t(), new_state :: any}
   def checkin(%{sock: {_mod, sock}} = s) do
-    :ok = :inet.setopts(sock, active: :once)
-
-    {:ok, s}
+    case :inet.setopts(sock, active: :once) do
+      :ok -> {:ok, s}
+      {:error, posix} -> {:disconnect, Tds.Error.exception(posix), s}
+    end
   end
 
+  @impl DBConnection
+  @spec handle_execute(
+          Tds.Query.t(),
+          DBConnection.params(),
+          opts :: Keyword.t(),
+          state :: Protocol.t()
+        ) ::
+          {:ok, Tds.Query.t(), Tds.Result.t(), new_state :: Protocol.t()}
+          | {:error | :disconnect, Exception.t(), new_state :: Protocol.t()}
   def handle_execute(
         %Query{handle: handle, statement: statement} = query,
         params,
@@ -116,7 +158,6 @@ defmodule Tds.Protocol do
         %{sock: _sock} = s
       ) do
     params = opts[:parameters] || params
-
     try do
       if params != [] do
         send_param_query(query, params, s)
@@ -125,8 +166,11 @@ defmodule Tds.Protocol do
       end
     rescue
       exception ->
-        stacktrace = System.stacktrace()
-        reraise exception, stacktrace
+        {:error, exception, s}
+    else
+      {:ok, result, state} ->
+        {:ok, query, result, state}
+      other -> other
     after
       unless is_nil(handle) do
         handle_close(query, opts, s)
@@ -134,6 +178,14 @@ defmodule Tds.Protocol do
     end
   end
 
+  @impl DBConnection
+  @spec handle_prepare(
+          Tds.Query.t(),
+          opts :: Keyword.t(),
+          state :: Protocol.t()
+        ) ::
+          {:ok, Tds.Query.t(), new_state :: Protocol.t()}
+          | {:error | :disconnect, Exception.t(), new_state :: Protocol.t()}
   def handle_prepare(%{statement: statement}, opts, %{sock: _sock} = s) do
     params =
       opts[:parameters]
@@ -142,12 +194,21 @@ defmodule Tds.Protocol do
     send_prepare(statement, params, s)
   end
 
+  @impl DBConnection
+  @spec handle_close(Query.t(), opts :: Keyword.t(), state :: Protocol.t()) ::
+          {:ok, Tds.Result.t(), new_state :: Protocol.t()}
+          | {:error | :disconnect, Exception.t(), new_state :: Protocol.t()}
   def handle_close(query, opts, %{sock: _sock} = s) do
     params = opts[:parameters]
 
     send_close(query, params, s)
   end
 
+  @impl DBConnection
+  @spec handle_begin(opts :: Keyword.t(), state :: Protocol.t()) ::
+          {:ok, Tds.Result.t(), new_state :: Protocol.t()}
+          | {DBConnection.status(), new_state :: Protocol.t()}
+          | {:error | :disconnect, Exception.t(), new_state :: Prototcol.t()}
   def handle_begin(opts, %{sock: _, env: env} = s) do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction ->
@@ -161,6 +222,11 @@ defmodule Tds.Protocol do
     end
   end
 
+  @impl DBConnection
+  @spec handle_commit(opts :: Keyword.t(), state :: any) ::
+          {:ok, Tds.Result.t(), new_state :: Protocol.t()}
+          | {DBConnection.status(), new_state :: Protocol.t()}
+          | {:error | :disconnect, Exception.t(), new_state :: Protocol.t()}
   def handle_commit(opts, %{transaction: transaction} = s) do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction when transaction == :failed ->
@@ -179,7 +245,12 @@ defmodule Tds.Protocol do
     end
   end
 
-  def handle_rollback(opts, %{sock: _sock, env: env} = s) do
+  @impl DBConnection
+  @spec handle_rollback(opts :: Keyword.t(), state :: any) ::
+          {:ok, Tds.Result.t(), new_state :: Protocol.t()}
+          | {:idle, new_state :: Protocol.t()}
+          | {:error | :disconnect, Exception.t(), new_state :: Protocol.t()}
+  def handle_rollback(opts, %Protocol{sock: _sock, env: env} = s) do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction ->
         env = %{env | savepoint: 0}
@@ -194,20 +265,54 @@ defmodule Tds.Protocol do
     end
   end
 
-  def handle_first(_query, _cursor, _opts, state) do
-    {:error, RuntimeError.exception("Not supported yet."), state}
+  @impl DBConnection
+  @spec handle_status(opts :: Keyword.t(), state :: Protocol.t()) ::
+          {:idle | :transaction | :error, new_state :: Protocol.t()}
+          | {:disconnect, Exception.t(), new_state :: Protocol.t()}
+  def handle_status(_opts, _state) do
+    _query = "SELECT @@trancount AS tran_count"
+    raise "Not yet implemented"
   end
 
+  @impl DBConnection
+  @spec handle_fetch(
+          Query.t(),
+          cursor :: any(),
+          opts :: Keyword.t(),
+          state :: Protocol.t()
+        ) ::
+          {:cont | :halt, Tds.Result.t(), new_state :: Protocol.t()}
+          | {:error | :disconnect, Exception.t(), new_state :: Protocol.t()}
+  def handle_fetch(_query, _cursor, _opts, state) do
+    {:error, Tds.Error.exception("Cursor is not supported by TDS"), state}
+  end
+
+  @impl DBConnection
+  @spec handle_deallocate(
+          query :: Query.t(),
+          cursor :: any,
+          opts :: Keyword.t(),
+          state :: Protocol.t()
+        ) ::
+          {:ok, Tds.Result.t(), new_state :: Protocol.t()}
+          | {:error | :disconnect, Exception.t(), new_state :: Protocol.t()}
   def handle_deallocate(_query, _cursor, _opts, state) do
-    {:error, RuntimeError.exception("Not supported yet."), state}
+    {:error, Tds.Error.exception("Cursor operations are not supported in TDS"),
+     state}
   end
 
+  @impl DBConnection
+  @spec handle_declare(
+          Query.t(),
+          params :: any,
+          opts :: Keyword.t(),
+          state :: Protocol.t()
+        ) ::
+          {:ok, Query.t(), cursor :: any, new_state :: Protocol.t()}
+          | {:error | :disconnect, Exception.t(), new_state :: Protocol.t()}
   def handle_declare(_query, _params, _opts, state) do
-    {:error, RuntimeError.exception("Not supported yet."), state}
-  end
-
-  def handle_next(_query, _cursor, _opts, state) do
-    {:error, RuntimeError.exception("Not supported yet."), state}
+    {:error, Tds.Error.exception("Cursor operations are not supported in TDS"),
+     state}
   end
 
   # CONNECTION
@@ -677,7 +782,7 @@ defmodule Tds.Protocol do
         %{opts: opts} = s
       ) do
     # we got an ENVCHANGE:redirection token, we need to disconnect and start over with new server
-    disconnect("redirected", s)
+    disconnect(Tds.Error.exception(:redirected), s)
     %{hostname: host, port: port} = tokens[:env_redirect]
 
     new_opts =
